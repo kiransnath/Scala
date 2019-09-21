@@ -1,0 +1,153 @@
+import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.functions._
+import org.apache.spark.sql.functions.input_file_name
+import org.apache.spark.sql.functions.col
+import org.apache.spark.sql.functions.countDistinct
+import org.apache.spark.sql.DataFrame
+import org.apache.spark.sql.types.{StructType, ArrayType, StructField, StringType}
+import org.apache.spark.sql.Column
+import org.apache.spark.sql.SQLContext
+import org.apache.spark.sql.SQLContext._
+import org.apache.spark.sql.types._
+import org.apache.spark.SparkContext
+import org.apache.spark.SparkConf
+import org.apache.spark.rdd.RDD
+import org.apache.hadoop.io.Text
+import org.apache.hadoop.io.LongWritable
+import org.apache.hadoop.dynamodb.DynamoDBItemWritable
+import org.apache.hadoop.dynamodb.read.DynamoDBInputFormat
+import org.apache.hadoop.dynamodb.write.DynamoDBOutputFormat
+import org.apache.hadoop.mapred.JobConf
+import org.json4s._
+import org.json4s.jackson.JsonMethods._
+
+import java.text.SimpleDateFormat
+import java.util.Calendar
+import java.util.TimeZone
+import java.util.HashMap
+
+import com.amazonaws.auth.{DefaultAWSCredentialsProviderChain, BasicAWSCredentials}
+import com.amazonaws.services.s3.AmazonS3Client
+import com.amazonaws.services.s3.model.{CopyObjectRequest, DeleteObjectRequest}
+import com.amazonaws.services.dynamodbv2.model.AttributeValue
+import com.amazonaws.services.dynamodbv2.document.{ DynamoDB, Table, Item }
+import com.amazonaws.services.dynamodbv2.AmazonDynamoDBClientBuilder
+
+import scala.util.matching.Regex
+import scala.collection.mutable.{WrappedArray, ListBuffer, Buffer}
+import collection.JavaConverters._
+import sys.process._
+
+//Command line parameters to be passed with spark-submit
+//val env = arg(0)
+//val appname = arg(1)
+//val region = args(2)
+//val s3_archive_path = env + "-" region + "-paybi-archive/data/"
+
+//Uncomment below for testing
+val env = "dev"
+val appName = "partition_archive_delete"
+val region = "us-west-2"
+
+//Source from dynamo DB
+val s3_archive_path = "dev-us-west-2-paybi-archive/data/"
+val wait_days_to_archive = "37".toInt
+
+//Calculate the threshold_date. If action date is <= threshold date then archive.
+val calender = Calendar.getInstance()
+calender.roll(Calendar.DAY_OF_YEAR, -wait_days_to_archive)
+val sdf = new SimpleDateFormat("yyyy-MM-dd")
+val archive_threshold_day = sdf.format(calender.getTime())
+
+val spark = SparkSession.builder().appName(appName).enableHiveSupport().getOrCreate()
+spark.sparkContext.hadoopConfiguration.set("mapreduce.fileoutputcommitter.marksuccessfuljobs", "false")
+
+import spark.implicits._
+implicit val formats = DefaultFormats // for json4s json parser
+
+val credentials = new DefaultAWSCredentialsProviderChain().getCredentials()
+
+val amazonS3Client = new AmazonS3Client(credentials)
+
+//Dynamodb partition tables
+val ddb_Partition_Live_Table = env+"-partition-live"
+val ddb_Partition_Log_Table = env+"-partition-log"
+val ddb_Partition_Work_To_Do_Table = env+"-partition-work-to-do"
+
+//Uncomment for testing
+val ddb_Partition_Work_To_Do_Table = "dev-partition-work-to-do-kiran"
+
+//Settings for reading from dynamodb
+var jobConf = new JobConf(spark.sparkContext.hadoopConfiguration)
+jobConf.set("dynamodb.servicename", "dynamodb")
+jobConf.set("dynamodb.endpoint", "dynamodb."+region+".amazonaws.com")
+jobConf.set("dynamodb.regionid", region)
+jobConf.set("mapred.output.format.class", "org.apache.hadoop.dynamodb.write.DynamoDBOutputFormat")
+jobConf.set("mapred.input.format.class", "org.apache.hadoop.dynamodb.read.DynamoDBInputFormat")
+
+
+//function to serialize the string value in RDD
+def extractValue : (String => String) = (aws:String) => {
+    val pat_value = "\\s(.*),".r
+    val matcher = pat_value.findFirstMatchIn(aws)
+                matcher match {
+                case Some(number) => number.group(1).toString
+                case None => ""
+       }
+}
+
+val col_extractValue = udf(extractValue)
+
+jobConf.set("dynamodb.input.tableName",ddb_Partition_Work_To_Do_Table )  // SourceTable
+var TableName = spark.sparkContext.hadoopRDD(jobConf, classOf[DynamoDBInputFormat], classOf[Text], classOf[DynamoDBItemWritable])
+
+val ddb_Partition_Work_To_Do_RDD: RDD[(String, String, String, String, String, String, String , String, String)] = TableName.map {
+case (text, dbwritable) => (dbwritable.getItem().get("s3_path").toString(),
+                            dbwritable.getItem().get("partition").toString(),
+                            dbwritable.getItem().get("table_name").toString(),
+                            dbwritable.getItem().get("status").toString(),
+                            dbwritable.getItem().get("action_dt").toString(),
+                            dbwritable.getItem().get("build_dt").toString(),
+                            dbwritable.getItem().get("partition_string").toString(),
+                            dbwritable.getItem().get("row_count").toString(),
+                            dbwritable.getItem().get("file_count").toString()
+                            )
+                       }
+//Log: printing the Dynamo db table retrived
+//ddb_Partition_Work_To_Do_RDD.toDF().show()
+
+val ddb_Partition_Work_To_Do_PendingDelete_DF = ddb_Partition_Work_To_Do_RDD.toDF().
+                                            withColumn("s3_path", col_extractValue($"_1")).
+                                            withColumn("partition", col_extractValue($"_2")).
+                                            withColumn("table_name", col_extractValue($"_3")).
+                                            withColumn("status", col_extractValue($"_4")).
+                                            withColumn("action_dt", col_extractValue($"_5")).
+                                            withColumn("build_dt", col_extractValue($"_6")).
+                                            withColumn("partition_string", col_extractValue($"_7")).
+                                            withColumn("row_count", col_extractValue($"_8")).
+                                            withColumn("file_count", col_extractValue($"_9")).
+                                            filter(  $"status" === "pending-delete" and $"action_dt" >= archive_threshold_day).
+                                            orderBy($"partition".asc)
+
+//Upgrade AWS Cli - remove below line if we go with bootstrap action
+val upgrade = "pip install -Iv awscli==1.16.241 --upgrade --user" !!
+
+//Archiving to glacier and deleting from S3 and Dynamo
+val client = AmazonDynamoDBClientBuilder.standard().build()
+val ddb    = new DynamoDB(client)
+val table  = ddb.getTable(ddb_Partition_Work_To_Do_Table)
+
+val folderlist = ddb_Partition_Work_To_Do_PendingDelete_DF.select("s3_path","partition").distinct.map(r => r.getString(0)).collect
+folderlist.foreach { row =>
+val source_path = row
+println("source_path:" +source_path)
+val tmp_string_1 = source_path.replace("s3://","")
+val tmp_string_2 = tmp_string_1.substring(tmp_string_1.indexOf("/")+1)
+val partition = tmp_string_2.reverse.substring(0,a.indexOf("=")).reverse
+println("partition:" +partition)
+val target_path = "s3://"+s3_archive_path+tmp_string_2
+println("target_path:" +target_path)
+val cli_cmd_archive = "aws s3 sync"+" "+source_path+" "+target_path+" "+"--storage-class GLACIER" !!
+//val cli_cmd_delete = "aws s3 rm"+" "+source_path+" "+"--recursive" !!
+val item   = table.deleteItem("s3_path",source_path,"partition",partition)
+}
